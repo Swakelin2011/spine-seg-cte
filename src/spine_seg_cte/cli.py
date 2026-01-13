@@ -1,13 +1,13 @@
 """Command-line interface for spine segmentation."""
 
 import sys
-from spine_seg_cte.pipeline import main
+import runpy
 
 
-def cli():
+def main():
     """Entry point for command-line interface."""
     try:
-        main()
+        runpy.run_module('spine_seg_cte.pipeline', run_name='__main__')
     except KeyboardInterrupt:
         print("\n\nAnalysis interrupted by user.")
         sys.exit(1)
@@ -17,4 +17,4 @@ def cli():
 
 
 if __name__ == "__main__":
-    cli()
+    main()

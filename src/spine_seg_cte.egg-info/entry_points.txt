@@ -1,0 +1,2 @@
+[console_scripts]
+spine-seg-cte = spine_seg_cte.cli:main
