@@ -1157,6 +1157,10 @@ def process_single_patient(scan_info, output_dirs, use_plane_pruning):
         return {'patient_id': patient_id, 'success': False, 'error': error_details}
 
 def process_all_patients_parallel(scans, output_dirs, num_workers, use_plane_pruning):
+    """
+    Process all patients - with Windows multiprocessing fix.
+    On Windows, multiprocessing with CUDA doesn't work well, so we force sequential processing.
+    """
     print(f"[3/4] Analyzing vertebrae...")
     print(f"  Workers: {num_workers}\n")
     
@@ -1167,21 +1171,38 @@ def process_all_patients_parallel(scans, output_dirs, num_workers, use_plane_pru
     
     print(f"  Processing {len(scans_with_seg)}/{len(scans)} scans\n")
     
-    process_func = partial(process_single_patient, 
-                          output_dirs=output_dirs,
-                          use_plane_pruning=use_plane_pruning)
-    
     all_results = []
     failed_patients = []
     
-    with Pool(processes=num_workers) as pool:
-        with tqdm(total=len(scans), desc="Analyzing patients", unit="patient") as pbar:
-            for result in pool.imap_unordered(process_func, scans, chunksize=1):
+    # Check if we're on Windows or if num_workers is 1
+    import platform
+    is_windows = platform.system() == 'Windows'
+    
+    # Force sequential processing on Windows or if num_workers=1
+    if is_windows or num_workers == 1:
+        print("  Using sequential processing (Windows or single worker mode)")
+        with tqdm(total=len(scans_with_seg), desc="Analyzing patients", unit="patient") as pbar:
+            for scan in scans_with_seg:
+                result = process_single_patient(scan, output_dirs, use_plane_pruning)
                 if isinstance(result, list):
                     all_results.extend(result)
                 elif isinstance(result, dict) and not result.get('success', False):
                     failed_patients.append(result)
                 pbar.update(1)
+    else:
+        # Unix/Linux parallel processing
+        process_func = partial(process_single_patient, 
+                              output_dirs=output_dirs,
+                              use_plane_pruning=use_plane_pruning)
+        
+        with Pool(processes=num_workers) as pool:
+            with tqdm(total=len(scans_with_seg), desc="Analyzing patients", unit="patient") as pbar:
+                for result in pool.imap_unordered(process_func, scans_with_seg, chunksize=1):
+                    if isinstance(result, list):
+                        all_results.extend(result)
+                    elif isinstance(result, dict) and not result.get('success', False):
+                        failed_patients.append(result)
+                    pbar.update(1)
     
     print(f"\nAnalysis: {len(all_results)} vertebrae processed")
     if failed_patients:
