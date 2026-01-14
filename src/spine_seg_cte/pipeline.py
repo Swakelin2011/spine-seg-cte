@@ -35,7 +35,7 @@ CONFIG = {
     'num_layers': 100,
     'min_vertebra_volume': 1000,
     'save_segmentations': True,
-    'save_individual_vertebrae': True,
+    'save_individual_vertebrae': False,
     'save_combined_patient': True,
     'verbose_workers': False,
     'use_plane_pruning': True,
@@ -579,29 +579,29 @@ def segment_endplates_by_normals(ct_data, vertebra_mask, cortical_mask, trabecul
     
     sup_z = np.where(superior_endplate)[2]
     if len(sup_z) > 0:
+        # VECTORIZED - much faster!
+        any_xy = superior_endplate.any(axis=2)
+        top_z_indices = superior_endplate.shape[2] - 1 - np.argmax(superior_endplate[:, :, ::-1], axis=2)
+        
         outer_surface_superior = np.zeros_like(superior_endplate, dtype=bool)
-        for x in range(superior_endplate.shape[0]):
-            for y in range(superior_endplate.shape[1]):
-                z_slice = superior_endplate[x, y, :]
-                if np.any(z_slice):
-                    top_z = np.where(z_slice)[0].max()
-                    outer_surface_superior[x, y, top_z] = True
+        y_coords, x_coords = np.where(any_xy)
+        outer_surface_superior[x_coords, y_coords, top_z_indices[x_coords, y_coords]] = True
         
         dist_from_outer_sup = distance_transform_edt(~outer_surface_superior, sampling=voxel_spacing)
         superior_thickness = np.max(dist_from_outer_sup[superior_endplate])
     else:
         superior_thickness = 0
-    
+
     if not is_sacrum_flag:
         inf_z = np.where(inferior_endplate)[2]
         if len(inf_z) > 0:
+            # VECTORIZED - much faster!
+            any_xy_inf = inferior_endplate.any(axis=2)
+            bottom_z_indices = np.argmax(inferior_endplate, axis=2)
+            
             outer_surface_inferior = np.zeros_like(inferior_endplate, dtype=bool)
-            for x in range(inferior_endplate.shape[0]):
-                for y in range(inferior_endplate.shape[1]):
-                    z_slice = inferior_endplate[x, y, :]
-                    if np.any(z_slice):
-                        bottom_z = np.where(z_slice)[0].min()
-                        outer_surface_inferior[x, y, bottom_z] = True
+            y_coords_inf, x_coords_inf = np.where(any_xy_inf)
+            outer_surface_inferior[x_coords_inf, y_coords_inf, bottom_z_indices[x_coords_inf, y_coords_inf]] = True
             
             dist_from_outer_inf = distance_transform_edt(~outer_surface_inferior, sampling=voxel_spacing)
             inferior_thickness = np.max(dist_from_outer_inf[inferior_endplate])
@@ -625,36 +625,58 @@ def segment_endplates_by_normals(ct_data, vertebra_mask, cortical_mask, trabecul
 # MAIN EXTRACTION FUNCTION
 # ============================================================
 
-def extract_vertebra_metrics(ct_path, vertebra_mask_input, ct_img_orig, ct_img, voxel_spacing, 
+
+def extract_vertebra_metrics(ct_data, vertebra_mask_input, ct_img_orig, ct_img, voxel_spacing, 
                             num_layers, is_sacrum_flag, use_plane_pruning):
     """
     Extract metrics for a single vertebra.
-    Now accepts a pre-computed mask instead of loading from seg_path.
+    OPTIMIZED: Now accepts ct_data directly instead of loading it.
     """
     try:
-        ct_data = ct_img.get_fdata()
-        vertebra_mask = vertebra_mask_input  # Use the provided mask directly
+        # ct_data is now passed in - NO get_fdata() call!
+        vertebra_mask = vertebra_mask_input
         
         if np.sum(vertebra_mask) < CONFIG['min_vertebra_volume']:
             return None
         
+        # OPTIMIZATION 3: Crop to bounding box (speeds up everything)
+        coords = np.array(np.where(vertebra_mask)).T
+        mins = np.maximum(coords.min(axis=0) - 5, 0)
+        maxs = np.minimum(coords.max(axis=0) + 6, vertebra_mask.shape)
+        slc = tuple(slice(int(mins[d]), int(maxs[d])) for d in range(3))
+        
+        # Work on cropped data
+        ct_data_crop = ct_data[slc]
+        vertebra_mask_crop = vertebra_mask[slc]
+        
         cortical_result = adaptive_segment_using_gradient(
-            ct_data, vertebra_mask, voxel_spacing, num_layers
+            ct_data_crop, vertebra_mask_crop, voxel_spacing, num_layers
         )
         
-        cortical_mask = cortical_result['cortical']
-        trabecular_mask = cortical_result['trabecular']
+        cortical_mask_crop = cortical_result['cortical']
+        trabecular_mask_crop = cortical_result['trabecular']
         
         endplate_result = segment_endplates_by_normals(
-            ct_data, vertebra_mask, cortical_mask, trabecular_mask, 
+            ct_data_crop, vertebra_mask_crop, cortical_mask_crop, trabecular_mask_crop, 
             voxel_spacing, is_sacrum_flag, use_plane_pruning
         )
         
         if endplate_result is None:
             return None
         
-        superior_endplate = endplate_result['superior_endplate']
-        inferior_endplate = endplate_result['inferior_endplate']
+        superior_endplate_crop = endplate_result['superior_endplate']
+        inferior_endplate_crop = endplate_result['inferior_endplate']
+        
+        # Paste back to full size
+        superior_endplate = np.zeros_like(vertebra_mask, dtype=bool)
+        inferior_endplate = np.zeros_like(vertebra_mask, dtype=bool)
+        cortical_mask = np.zeros_like(vertebra_mask, dtype=bool)
+        trabecular_mask = np.zeros_like(vertebra_mask, dtype=bool)
+        
+        superior_endplate[slc] = superior_endplate_crop
+        inferior_endplate[slc] = inferior_endplate_crop
+        cortical_mask[slc] = cortical_mask_crop
+        trabecular_mask[slc] = trabecular_mask_crop
         
         cortical_final = cortical_mask & ~superior_endplate & ~inferior_endplate
         trabecular_final = trabecular_mask & ~superior_endplate & ~inferior_endplate
@@ -710,6 +732,7 @@ def extract_vertebra_metrics(ct_path, vertebra_mask_input, ct_img_orig, ct_img, 
         
     except Exception as e:
         return {'success': False, 'error': str(e)[:200]}
+
 
 # ============================================================
 # FILE MANAGEMENT
@@ -1056,9 +1079,10 @@ def process_single_patient(scan_info, output_dirs, use_plane_pruning):
         return {'patient_id': patient_id, 'success': False, 'error': 'No total segmentation'}
     
     try:
-        # Load CT image once
+        # Load CT image once - OPTIMIZED
         ct_img_orig = nib.load(ct_path)
         ct_img = reorient_to_ras(ct_img_orig)
+        ct_data = np.asanyarray(ct_img.dataobj).astype(np.float32, copy=False)  # Load once!
         voxel_spacing = ct_img.header.get_zooms()
         
         # Split vertebrae_body into individual vertebrae using total labels
@@ -1084,9 +1108,9 @@ def process_single_patient(scan_info, output_dirs, use_plane_pruning):
                 confidence = vert_data['confidence']
                 is_sacrum_flag = (total_label == 26)
                 
-                # Extract metrics using the individual vertebra mask
+                # Extract metrics - NOW PASSING CT_DATA directly
                 metrics = extract_vertebra_metrics(
-                    ct_path, vertebra_mask_ras, ct_img_orig, ct_img, voxel_spacing,
+                    ct_data, vertebra_mask_ras, ct_img_orig, ct_img, voxel_spacing,
                     CONFIG['num_layers'], is_sacrum_flag, use_plane_pruning
                 )
                 
@@ -1384,26 +1408,26 @@ if __name__ == "__main__":
             patient_id = scan['patient_id']
             patient_dir = Path(output_dirs['vertebrae_seg']) / patient_id
             
-            vertebrae_body_file = patient_dir / 'vertebrae_body' / 'vertebrae_body.nii.gz'
-            total_file = patient_dir / 'total' / 'total.nii.gz'
+            # Look for vertebrae_body file (flexible - checks multiple locations/names)
+            vertebrae_body_file = None
+            possible_vb_files = [
+                patient_dir / 'vertebrae_body.nii',
+                patient_dir / 'vertebrae_body.nii.gz',
+                patient_dir / 'vertebrae_body' / 'vertebrae_body.nii',
+                patient_dir / 'vertebrae_body' / 'vertebrae_body.nii.gz',
+            ]
             
-            if vertebrae_body_file.exists():
-                scan['vertebrae_seg_path'] = str(vertebrae_body_file)
-            else:
-                vertebrae_body_dir = patient_dir / 'vertebrae_body'
-                if vertebrae_body_dir.exists():
-                    found = list(vertebrae_body_dir.glob('*.nii*'))
-                    if found:
-                        scan['vertebrae_seg_path'] = str(found[0])
-            
-            if total_file.exists():
-                scan['vertebrae_levels_path'] = str(total_file)
-            else:
-                total_dir = patient_dir / 'total'
-                if total_dir.exists():
-                    found = list(total_dir.glob('*.nii*'))
-                    if found:
-                        scan['vertebrae_levels_path'] = str(found[0])
+            for vb_file in possible_vb_files:
+                if vb_file.exists():
+                    scan['vertebrae_seg_path'] = str(vb_file)
+                    break
+    
+            # Look for total file (flexible)
+            for total_name in ['total.nii.gz', 'total.nii']:
+                total_file = patient_dir / total_name
+                if total_file.exists():
+                    scan['vertebrae_levels_path'] = str(total_file)
+                    break
         
         found_body = sum(1 for s in scans if s.get('vertebrae_seg_path'))
         found_total = sum(1 for s in scans if s.get('vertebrae_levels_path'))
